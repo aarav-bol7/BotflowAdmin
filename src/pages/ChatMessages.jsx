@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { ArrowLeft, Search, ChevronLeft, ChevronRight, AlertTriangle, Loader2, MessageSquare, Calendar, X } from 'lucide-react';
+import { ArrowLeft, Search, ChevronLeft, ChevronRight, AlertTriangle, Loader2, MessageSquare, Calendar, X, Trash2 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { chatService } from '../api/chatService';
+import flowService from '../api/flowService';
 import { botflowWs } from '../api/botflowWebSocket';
 import { mergeById, performReconnectCatchup } from '../api/reconnectCatchup';
 import { getBotsByTenant as enumGetBotsByTenant } from '../api/enumerationService';
@@ -974,6 +975,28 @@ function ChatMessages() {
           <MessageSquare className="w-5 h-5 text-slate-400" />
           {selectedSession && <ChannelBadge channel={selectedSession.channel} />}
           <span className="text-sm font-mono text-slate-900 dark:text-white">{selectedSession?.userId}</span>
+          <button
+            onClick={async () => {
+              if (!selectedSession || !selectedTenant || !selectedBot) return;
+              if (!window.confirm('Delete this session? Its messages/transcript are removed. Credit usage is preserved.')) return;
+              try {
+                await flowService.deleteSession(
+                  selectedTenant.tenantId, selectedBot.botKey,
+                  selectedSession.channel, selectedSession.userId,
+                );
+                toast.success('Session deleted');
+                setSelectedSession(null);
+                setView('sessions');
+                loadSessions(selectedTenant.tenantId, selectedBot.botKey, { channel: channelFilter });
+              } catch (e) {
+                toast.error(e.message || 'Failed to delete session');
+              }
+            }}
+            title="Delete this session (credit usage preserved)"
+            className="ml-auto inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/40 border border-red-200 dark:border-red-900/50"
+          >
+            <Trash2 className="w-3.5 h-3.5" /> Delete session
+          </button>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs text-slate-500 dark:text-slate-400">
           <div>Started: <span className="text-slate-700 dark:text-slate-300">{formatDate(selectedSession?.createdAt)}</span></div>

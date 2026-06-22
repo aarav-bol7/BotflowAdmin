@@ -48,6 +48,7 @@ function _matchSelfEcho(eventName, payload) {
 
 function GlobalDefault() {
   const [providers, setProviders] = useState([]);
+  const [voiceProviders, setVoiceProviders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [savingModels, setSavingModels] = useState(false);
   const [savingLlmBilling, setSavingLlmBilling] = useState(false);
@@ -64,6 +65,12 @@ function GlobalDefault() {
   const [voiceModelId, setVoiceModelId] = useState('');
   const [voiceApiKey, setVoiceApiKey] = useState('');
   const [voiceTemperature, setVoiceTemperature] = useState(null);
+  // Realtime WS URL — required when provider_key === 'azure' (per-deployment),
+  // optional override otherwise (backend falls back to provider template).
+  const [voiceWebsocketUrl, setVoiceWebsocketUrl] = useState('');
+  // Platform default voice persona. Empty string = "use the catalog
+  // default_voice for the picked model" (seeded as a male voice).
+  const [voiceName, setVoiceName] = useState('');
 
   // Database defaults
   const [dbType, setDbType] = useState('');
@@ -142,11 +149,58 @@ function GlobalDefault() {
 
   useEffect(() => {
     Promise.all([
-      flowService.getProviders().catch(() => []),
+      // Chat catalog — spec-shape endpoint. Lightweight: provider list only,
+      // models load on-demand per provider via getChatModelsForProvider.
+      flowService.getChatProviders().catch(() => ({ providers: [] })),
+      flowService.getVoiceProviders().catch(() => []),
       flowService.getGlobalDefaults().catch(() => ({ chat: {}, voice: {} })),
       flowService.getBillingConfig().catch(() => null),
-    ]).then(([providerList, defaults, billingConfig]) => {
-      setProviders(providerList || []);
+    ]).then(([chatProvidersPayload, voiceProviderList, defaults, billingConfig]) => {
+      // Spec-shape: { providers: [{id, label, icon, supports_chat,
+      // supports_realtime}] }. Massage into the {key, name, models[str]}
+      // shape ModelCard already consumes — models stay empty until the
+      // user picks a provider (lazy fetch).
+      const chatProvidersList = Array.isArray(chatProvidersPayload?.providers)
+        ? chatProvidersPayload.providers
+        : [];
+      const normalizedChat = chatProvidersList.map((p) => ({
+        key: p.id,
+        name: p.label || p.id,
+        icon_url: p.icon || '',
+        models: [], // lazy — populated by getChatModelsForProvider on select
+      }));
+      setProviders(normalizedChat);
+      // Voice rows ship richer metadata (protocol, ws_base_url) but ModelCard
+      // only consumes {key, name, models: [model_id]}. Normalize the model
+      // entries down to model_id strings so the existing picker UI works
+      // unchanged. ``protocol`` is appended to the display name so the
+      // operator sees which wire format the runtime will speak.
+      const normalizedVoice = (voiceProviderList || []).map((p) => ({
+        key: p.key,
+        name: p.protocol ? `${p.name} · ${p.protocol}` : p.name,
+        icon_url: p.icon_url || '',
+        // Preserve URL metadata so the voice ModelCard can pre-fill the
+        // WS-URL placeholder and mark Azure as required.
+        websocket_url_template: p.websocket_url_template || '',
+        is_url_editable: !!p.is_url_editable,
+        models: Array.isArray(p.models)
+          ? p.models.map((m) => (typeof m === 'string' ? m : m.model_id))
+          : [],
+        // Per-model voice catalogs (voices + default_voice + voice_genders)
+        // — keyed by model_id so the ModelCard can populate the voice
+        // dropdown once a model is selected.
+        modelVoices: Array.isArray(p.models)
+          ? Object.fromEntries(p.models.map((m) => [
+              typeof m === 'string' ? m : m.model_id,
+              {
+                voices: (typeof m === 'string' ? [] : (m.voices || [])),
+                default_voice: (typeof m === 'string' ? '' : (m.default_voice || '')),
+                voice_genders: (typeof m === 'string' ? {} : (m.voice_genders || {})),
+              },
+            ]))
+          : {},
+      }));
+      setVoiceProviders(normalizedVoice);
       if (defaults.chat) {
         setChatProviderKey(defaults.chat.provider_key || '');
         setChatModelId(defaults.chat.model_id || '');
@@ -158,6 +212,8 @@ function GlobalDefault() {
         setVoiceModelId(defaults.voice.model_id || '');
         setVoiceApiKey(defaults.voice.api_key || '');
         setVoiceTemperature(defaults.voice.temperature ?? null);
+        setVoiceWebsocketUrl(defaults.voice.websocket_url || '');
+        setVoiceName(defaults.voice.voice_name || '');
       }
       if (defaults.database) {
         const db = defaults.database;
@@ -245,8 +301,10 @@ function GlobalDefault() {
       model_id: voiceModelId,
       api_key: voiceApiKey,
       temperature: voiceTemperature,
+      websocket_url: voiceWebsocketUrl,
+      voice_name: voiceName,
     };
-  }, [voiceProviderKey, voiceModelId, voiceApiKey, voiceTemperature]);
+  }, [voiceProviderKey, voiceModelId, voiceApiKey, voiceTemperature, voiceWebsocketUrl, voiceName]);
   useEffect(() => { localLlmBillingRef.current = llmBilling; }, [llmBilling]);
   useEffect(() => { localVoiceBillingRef.current = voiceBilling; }, [voiceBilling]);
   useEffect(() => {
@@ -330,6 +388,8 @@ function GlobalDefault() {
         model_id: setVoiceModelId,
         api_key: setVoiceApiKey,
         temperature: setVoiceTemperature,
+        websocket_url: setVoiceWebsocketUrl,
+        voice_name: setVoiceName,
       },
     ));
     // Notifications
@@ -445,6 +505,8 @@ function GlobalDefault() {
         else if (field === 'model_id') setVoiceModelId(incomingValue);
         else if (field === 'api_key') setVoiceApiKey(incomingValue);
         else if (field === 'temperature') setVoiceTemperature(incomingValue);
+        else if (field === 'websocket_url') setVoiceWebsocketUrl(incomingValue || '');
+        else if (field === 'voice_name') setVoiceName(incomingValue || '');
         lastLoadedDefaultsRef.current.voice[field] = incomingValue;
       } else if (sectionKey === 'notifications') {
         if (field === 'notifications_enabled') setNotificationsEnabled(!!incomingValue);
@@ -506,17 +568,101 @@ function GlobalDefault() {
     return p ? p.models : [];
   };
 
+  const getVoiceModelsForProvider = (providerKey) => {
+    const p = voiceProviders.find((pr) => pr.key === providerKey);
+    return p ? p.models : [];
+  };
+
+  // Lazy per-provider chat-model fetch. Triggered when the operator picks
+  // a chat provider; result mutates the corresponding row in `providers`
+  // so getModelsForProvider can find it. Already-loaded providers are
+  // skipped (idempotent).
+  const fetchChatModelsForProvider = useCallback((providerKey) => {
+    if (!providerKey) return;
+    setProviders((prev) => {
+      const existing = prev.find((p) => p.key === providerKey);
+      if (existing && Array.isArray(existing.models) && existing.models.length > 0) {
+        return prev; // already cached
+      }
+      return prev;
+    });
+    flowService.getChatModelsForProvider(providerKey)
+      .then((payload) => {
+        const ids = Array.isArray(payload?.models)
+          ? payload.models.map((m) => m.id || m).filter(Boolean)
+          : [];
+        setProviders((prev) => prev.map((p) =>
+          p.key === providerKey ? { ...p, models: ids } : p,
+        ));
+      })
+      .catch((err) => {
+        // eslint-disable-next-line no-console
+        console.warn(`[GlobalDefault] chat models fetch failed for ${providerKey}:`, err);
+      });
+  }, []);
+
   const handleProviderChange = (type, key) => {
     if (type === 'chat') {
       setChatProviderKey(key);
       setChatModelId('');
+      if (key) fetchChatModelsForProvider(key);
     } else {
       setVoiceProviderKey(key);
       setVoiceModelId('');
+      // Voice catalogs are per-model. Clearing the model also invalidates
+      // the picked voice (e.g. ``Charon`` from Gemini → not in OpenAI's
+      // voice list). Leaving it would either: 400 at PUT (backend
+      // membership guard) or persist a voice the realtime API rejects.
+      setVoiceName('');
+      // When switching to a fixed-URL provider (Grok/OpenAI/Gemini), the
+      // stored override is irrelevant — the runtime falls back to the
+      // provider template. Clear it so a stale Azure URL doesn't ride along.
+      // For Azure (is_url_editable=true) the operator must (re-)enter their
+      // per-deployment URL anyway, so clearing is also safer there.
+      const next = (voiceProviders || []).find((p) => p.key === key);
+      if (!next || !next.is_url_editable) {
+        setVoiceWebsocketUrl('');
+      }
     }
   };
 
+  // Voice catalog for the picked (provider, model). Frontend reads this
+  // to populate the voice dropdown.
+  const _voiceCatalogForSelection = () => {
+    const p = (voiceProviders || []).find((q) => q.key === voiceProviderKey);
+    const entry = p?.modelVoices?.[voiceModelId];
+    return {
+      voices: entry?.voices || [],
+      default_voice: entry?.default_voice || '',
+      voice_genders: entry?.voice_genders || {},
+    };
+  };
+
+  // Pre-fetch chat models for whatever provider GlobalDefault already
+  // stores so the model dropdown is populated by the time the user
+  // opens it. Skips when chat provider is empty.
+  useEffect(() => {
+    if (chatProviderKey) fetchChatModelsForProvider(chatProviderKey);
+  }, [chatProviderKey, fetchChatModelsForProvider]);
+
+  // Helper: is the currently-selected voice provider editable URL? Falls
+  // back to the lowercase 'azure' heuristic when the catalog hasn't loaded.
+  const _voiceProviderEditable = () => {
+    const p = (voiceProviders || []).find((q) => q.key === voiceProviderKey);
+    if (p) return !!p.is_url_editable;
+    return (voiceProviderKey || '').toLowerCase() === 'azure';
+  };
+  const voiceUrlMissingForEditable = _voiceProviderEditable() && !(voiceWebsocketUrl || '').trim();
+
   const handleSaveModels = async () => {
+    // Pre-save guard: Azure (or any other future is_url_editable=true
+    // provider) MUST have a non-blank URL. Block client-side to avoid the
+    // server-round-trip + toast pattern and to keep the rose-border flag
+    // honest. Defense-in-depth: backend still 400s the same case.
+    if (voiceUrlMissingForEditable) {
+      toast.error('WebSocket URL is required for the selected voice provider.');
+      return;
+    }
     setSavingModels(true);
     // Track D recovery: correlate broadcast→self-save via token.
     // sentFields covers both chat and voice sub-dicts (section names, not leaf keys).
@@ -531,6 +677,13 @@ function GlobalDefault() {
         voice_model_id: voiceModelId,
         voice_api_key: voiceApiKey,
         voice_temperature: voiceTemperature,
+        // For fixed-URL providers (OpenAI/Grok/Gemini) the displayed value
+        // is the substituted template — what the operator sees is NOT what
+        // is in state. Ship '' so the runtime falls back to the catalog
+        // template; otherwise a stale Azure URL loaded into state would
+        // ride along under a non-Azure provider and dial the wrong host.
+        voice_websocket_url: _voiceProviderEditable() ? (voiceWebsocketUrl || '').trim() : '',
+        voice_name: voiceName || '',
         _save_token: _token,
       });
       toast.success('Model defaults saved');
@@ -704,25 +857,35 @@ function GlobalDefault() {
         {/* Voice Model Default */}
         <ModelCard
           title="Voice Model (LLM)"
-          description="Default model for voice/realtime interactions"
+          description="Default model for voice/realtime interactions (admin-managed catalog)"
           icon={Mic}
           iconColor="text-purple-500"
           bgColor="bg-purple-500/10"
           borderAccent="border-t-purple-500"
-          providers={providers}
+          providers={voiceProviders}
           providerKey={voiceProviderKey}
           modelId={voiceModelId}
           apiKey={voiceApiKey}
           temperature={voiceTemperature}
+          websocketUrl={voiceWebsocketUrl}
+          voiceName={voiceName}
+          voiceCatalog={_voiceCatalogForSelection()}
           onProviderChange={(key) => handleProviderChange('voice', key)}
-          onModelChange={setVoiceModelId}
+          onModelChange={(modelId) => { setVoiceModelId(modelId); setVoiceName(''); }}
           onApiKeyChange={setVoiceApiKey}
           onTemperatureChange={setVoiceTemperature}
-          getModels={getModelsForProvider}
+          onWebsocketUrlChange={setVoiceWebsocketUrl}
+          onVoiceNameChange={setVoiceName}
+          getModels={getVoiceModelsForProvider}
         />
       </div>
       <div className="flex justify-end">
-        <button onClick={handleSaveModels} disabled={savingModels} className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white rounded-lg text-sm font-medium transition-colors">
+        <button
+          onClick={handleSaveModels}
+          disabled={savingModels || voiceUrlMissingForEditable}
+          title={voiceUrlMissingForEditable ? 'Set the per-deployment WebSocket URL before saving.' : ''}
+          className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white rounded-lg text-sm font-medium transition-colors"
+        >
           {savingModels ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
           {savingModels ? 'Saving...' : 'Save Model Defaults'}
         </button>
@@ -831,10 +994,178 @@ function GlobalDefault() {
   );
 }
 
-function ModelCard({ title, description, icon: Icon, iconColor, bgColor, borderAccent, providers, providerKey, modelId, apiKey, temperature, onProviderChange, onModelChange, onApiKeyChange, onTemperatureChange, getModels }) {
+// Custom dropdown with a hard-capped popup height (native <select> popups
+// are browser-controlled and ignore CSS height). Closes on outside click,
+// supports an inline search input, and falls back to rendering the
+// current value as a "ghost" row when it isn't in the option list (so
+// saved legacy values stay visible).
+function CappedDropdown({
+  value, options, onChange, placeholder = 'Select', disabled = false,
+  maxHeight = 240, searchPlaceholder = 'Search…',
+}) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const onClick = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onClick);
+    return () => document.removeEventListener('mousedown', onClick);
+  }, [open]);
+  const selected = (options || []).find((o) => o.key === value);
+  const label = selected?.name || (value && !selected ? value : placeholder);
+  const q = search.trim().toLowerCase();
+  const filtered = q
+    ? (options || []).filter((o) =>
+        (o.key || '').toLowerCase().includes(q)
+        || (o.name || '').toLowerCase().includes(q),
+      )
+    : (options || []);
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => setOpen((v) => !v)}
+        className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white disabled:opacity-50 focus:ring-2 focus:ring-blue-500 focus:border-transparent flex items-center justify-between text-left"
+      >
+        <span className={selected || value ? '' : 'text-slate-400'}>{label}</span>
+        <svg className={`w-4 h-4 ml-2 flex-shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} viewBox="0 0 20 20" fill="currentColor">
+          <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.06l3.71-3.83a.75.75 0 011.08 1.04l-4.25 4.39a.75.75 0 01-1.08 0L5.21 8.27a.75.75 0 01.02-1.06z" clipRule="evenodd" />
+        </svg>
+      </button>
+      {open && (
+        <div
+          className="absolute z-30 mt-1 w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 shadow-lg flex flex-col"
+          style={{ maxHeight }}
+        >
+          {(options || []).length > 8 && (
+            <div className="p-2 border-b border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 flex-shrink-0">
+              <input
+                autoFocus
+                type="text"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder={searchPlaceholder}
+                className="w-full px-2 py-1 text-xs rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+              />
+            </div>
+          )}
+          <div className="overflow-y-auto flex-1">
+            <button
+              type="button"
+              onClick={() => { onChange(''); setOpen(false); setSearch(''); }}
+              className={`w-full text-left px-3 py-2 text-sm hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500 dark:text-slate-400 ${!value ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300' : ''}`}
+            >
+              {placeholder}
+            </button>
+            {value && !selected && (
+              // Saved value not in current option list — surface it as a
+              // ghost row so the operator can re-select / replace it.
+              <button
+                type="button"
+                onClick={() => setOpen(false)}
+                className="w-full text-left px-3 py-2 text-sm bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-300 italic"
+              >
+                {value} <span className="text-[10px] not-italic">(current, not in catalog)</span>
+              </button>
+            )}
+            {filtered.length === 0 && (
+              <div className="px-3 py-3 text-xs text-slate-400 dark:text-slate-500 text-center">
+                {q ? `No matches for “${search}”` : 'No options available'}
+              </div>
+            )}
+            {filtered.map((o) => (
+              <button
+                type="button"
+                key={o.key}
+                onClick={() => { onChange(o.key); setOpen(false); setSearch(''); }}
+                className={`w-full text-left px-3 py-2 text-sm hover:bg-slate-100 dark:hover:bg-slate-800 ${o.key === value ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300' : 'text-slate-900 dark:text-white'}`}
+              >
+                {o.name}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ModelCard({ title, description, icon: Icon, iconColor, bgColor, borderAccent, providers, providerKey, modelId, apiKey, temperature, websocketUrl, voiceName, voiceCatalog, onProviderChange, onModelChange, onApiKeyChange, onTemperatureChange, onWebsocketUrlChange, onVoiceNameChange, getModels }) {
   const models = getModels(providerKey);
   const hasSelection = providerKey && modelId;
   const [showApiKey, setShowApiKey] = useState(false);
+  const [providerSearch, setProviderSearch] = useState('');
+  const [modelSearch, setModelSearch] = useState('');
+
+  // Voice-only WS URL state. Only the voice card passes onWebsocketUrlChange,
+  // so this whole block is dead-weight for the chat card.
+  const showWsUrl = typeof onWebsocketUrlChange === 'function';
+  const selectedProvider = providers.find((p) => p.key === providerKey) || null;
+  const wsTemplate = selectedProvider?.websocket_url_template || '';
+  // Provider catalog drives editability — Azure flags itself via
+  // ``is_url_editable=true``; OpenAI/Grok/Gemini ship as ``false``. Falling
+  // back to the legacy "key === 'azure'" check keeps things working if a
+  // provider row is misconfigured.
+  const wsIsEditable = selectedProvider
+    ? !!selectedProvider.is_url_editable
+    : ((providerKey || '').toLowerCase() === 'azure');
+  // Substitute {model} ONLY when both pieces are present. If a fixed-URL
+  // provider is picked but no model yet, render the field empty with a
+  // "pick a model" hint instead of leaking the literal "{model}" token
+  // (which looks like a bug to anyone unfamiliar with the template).
+  const wsRenderedTemplate = wsTemplate && modelId
+    ? wsTemplate.replace('{model}', modelId)
+    : '';
+  // For fixed-URL providers we show the resolved template as the (read-only)
+  // value so the operator sees exactly which endpoint the runtime will use.
+  // For editable providers (Azure) we show their stored override, with a
+  // helpful placeholder when blank.
+  const wsDisplayValue = wsIsEditable
+    ? (websocketUrl || '')
+    : wsRenderedTemplate;
+  // Catalog misconfig: provider says fixed-URL but template is blank
+  // (e.g. Gemini until its runtime is implemented). Loud-fail in the UI
+  // so the operator doesn't save a config that 1006s at call time.
+  const wsFixedButNoTemplate = !wsIsEditable && !!selectedProvider && !wsTemplate;
+  // For an editable provider we prefer the catalog template as the
+  // placeholder if it has one (hypothetical non-Azure editable provider),
+  // falling back to the Azure-style example otherwise.
+  const wsPlaceholder = wsIsEditable
+    ? (wsTemplate || 'wss://<your-resource>.openai.azure.com/openai/realtime?api-version=…&deployment=…')
+    : wsFixedButNoTemplate
+      ? 'This provider has no WebSocket URL configured in the catalog — runtime will fail.'
+      : (wsRenderedTemplate
+          || (selectedProvider
+              ? 'Pick a model to see the resolved URL'
+              : 'Pick a provider to see its fixed URL'));
+  const wsMissingForEditable = wsIsEditable && !((websocketUrl || '').trim());
+
+  // Voice dropdown is voice-card-only — chat card never passes
+  // onVoiceNameChange so this whole block compiles out for chat.
+  const showVoiceField = typeof onVoiceNameChange === 'function';
+  const voices = (voiceCatalog && voiceCatalog.voices) || [];
+  const catalogDefaultVoice = (voiceCatalog && voiceCatalog.default_voice) || '';
+  // What the runtime will dial if voiceName is left blank — useful to
+  // show as a hint, so the admin knows the bot defaults to ash/Rex/Charon
+  // when they don't pick anything.
+  const resolvedVoice = voiceName || catalogDefaultVoice;
+
+  const providerQ = providerSearch.trim().toLowerCase();
+  const filteredProviders = providerQ
+    ? providers.filter((p) =>
+        (p.key || '').toLowerCase().includes(providerQ)
+        || (p.name || '').toLowerCase().includes(providerQ),
+      )
+    : providers;
+
+  const modelQ = modelSearch.trim().toLowerCase();
+  const filteredModels = modelQ
+    ? models.filter((m) => (m || '').toLowerCase().includes(modelQ))
+    : models;
 
   return (
     <div className={`bg-white dark:bg-slate-900 rounded-xl border border-slate-200/50 dark:border-slate-800/50 border-t-4 ${borderAccent} p-6 flex flex-col`}>
@@ -856,37 +1187,48 @@ function ModelCard({ title, description, icon: Icon, iconColor, bgColor, borderA
       <div className="space-y-4 flex-1">
         {/* Provider */}
         <div>
-          <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-            Provider
+          <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1 flex items-center justify-between">
+            <span>Provider</span>
+            <span className="text-[10px] text-slate-400 dark:text-slate-500 font-normal">
+              {providers.length} available
+            </span>
           </label>
-          <select
+          {/* Filter input — critical when the chat catalog is ~143 providers
+              from models.dev. Empty input keeps the full <select> visible. */}
+          {/* Popup height is hard-capped via maxHeight so the dropdown
+              doesn't blow up vertically even with 143 chat providers. */}
+          <CappedDropdown
             value={providerKey}
-            onChange={(e) => onProviderChange(e.target.value)}
-            className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-          >
-            <option value="">Select provider</option>
-            {providers.map((p) => (
-              <option key={p.key} value={p.key}>{p.name}</option>
-            ))}
-          </select>
+            options={providers.map((p) => ({ key: p.key, name: p.name }))}
+            onChange={onProviderChange}
+            placeholder="Select provider"
+            searchPlaceholder="Search providers…"
+            maxHeight={260}
+          />
+          {providers.length === 0 && (
+            <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
+              No providers loaded — check the /api/llm/{title.toLowerCase().includes('voice') ? 'voice-models' : 'providers'}/ endpoint.
+            </p>
+          )}
         </div>
 
         {/* Model */}
         <div>
-          <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-            Model
+          <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1 flex items-center justify-between">
+            <span>Model</span>
+            <span className="text-[10px] text-slate-400 dark:text-slate-500 font-normal">
+              {providerKey ? `${models.length} for ${providerKey}` : '—'}
+            </span>
           </label>
-          <select
+          <CappedDropdown
             value={modelId}
-            onChange={(e) => onModelChange(e.target.value)}
+            options={models.map((m) => ({ key: m, name: m }))}
+            onChange={onModelChange}
+            placeholder={providerKey ? 'Select model' : 'Pick a provider first'}
+            searchPlaceholder="Search models…"
             disabled={!providerKey}
-            className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white disabled:opacity-50 focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-          >
-            <option value="">Select model</option>
-            {models.map((m) => (
-              <option key={m} value={m}>{m}</option>
-            ))}
-          </select>
+            maxHeight={260}
+          />
         </div>
 
         {/* API Key */}
@@ -911,6 +1253,128 @@ function ModelCard({ title, description, icon: Icon, iconColor, bgColor, borderA
             </button>
           </div>
         </div>
+
+        {/* WebSocket URL (voice only) — editable + required for Azure, read-only for fixed providers */}
+        {showWsUrl && (
+          <div>
+            <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1 flex items-center justify-between">
+              <span>
+                WebSocket URL
+                {wsIsEditable && (
+                  <span className="ml-1 text-rose-500" title="Required for this provider">*</span>
+                )}
+              </span>
+              <span className="text-[10px] text-slate-400 dark:text-slate-500 font-normal">
+                {wsIsEditable ? 'per-deployment' : 'fixed by provider'}
+              </span>
+            </label>
+            <input
+              type="text"
+              value={wsDisplayValue}
+              onChange={(e) => wsIsEditable && onWebsocketUrlChange(e.target.value)}
+              placeholder={wsPlaceholder}
+              readOnly={!wsIsEditable}
+              aria-readonly={!wsIsEditable}
+              title={
+                wsIsEditable
+                  ? ''
+                  : wsFixedButNoTemplate
+                    ? 'This provider has no WebSocket URL in the catalog.'
+                    : 'Fixed by provider — selecting the model is enough.'
+              }
+              className={`w-full px-3 py-2 text-sm rounded-lg border bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent ${
+                !wsIsEditable
+                  ? (wsFixedButNoTemplate
+                      ? 'bg-slate-50 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 cursor-not-allowed border-rose-400 dark:border-rose-500'
+                      : 'bg-slate-50 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 cursor-not-allowed border-slate-200 dark:border-slate-700')
+                  : wsMissingForEditable
+                    ? 'border-rose-400 dark:border-rose-500'
+                    : 'border-slate-200 dark:border-slate-700'
+              }`}
+            />
+            <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+              {wsIsEditable
+                ? 'Paste the per-deployment WSS URL (resource + api-version + deployment). Leaving this blank will fail at call time.'
+                : 'Fixed for this provider — the runtime substitutes the picked model into the template. No setup needed here.'}
+            </p>
+            {wsMissingForEditable && (
+              <p className="mt-1 text-[11px] text-rose-500 dark:text-rose-400">
+                Required — the realtime client has no way to dial without it.
+              </p>
+            )}
+            {wsFixedButNoTemplate && (
+              <p className="mt-1 text-[11px] text-rose-500 dark:text-rose-400">
+                No WebSocket URL configured for this provider in the catalog — the realtime client will fail at call time. Have an admin populate <code>websocket_url_template</code> on this provider row.
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* Voice — voice-card only. Populated from the picked model's
+            catalog (voices + default_voice came back from
+            /api/llm/voice-models/). Empty selection means "use the
+            catalog default" — backend resolver falls back to
+            VoiceModel.default_voice. Per-bot override still works via
+            the frontend-chatbot flow voicemodel node. */}
+        {showVoiceField && (
+          <div>
+            <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1 flex items-center justify-between">
+              <span>Voice</span>
+              <span className="text-[10px] text-slate-400 dark:text-slate-500 font-normal">
+                {voices.length > 0
+                  ? `${voices.length} multilingual`
+                  : (modelId ? 'no catalog' : 'pick a model first')}
+              </span>
+            </label>
+            {voices.length > 0 ? (
+              <CappedDropdown
+                value={voiceName || ''}
+                options={[
+                  // Sentinel: "Use default" leaves voice_name='' so the
+                  // backend resolver picks catalog default_voice.
+                  { key: '', name: catalogDefaultVoice
+                      ? `${(voiceCatalog?.voice_genders?.[catalogDefaultVoice] === 'female' ? '♀' : '♂')} Use default (${catalogDefaultVoice})`
+                      : 'Use default' },
+                  // Sorted: females first, males next, alphabetical within
+                  // each group. Makes it easy to scan for a gendered pick.
+                  ...[...voices]
+                    .map((v) => ({
+                      v,
+                      g: (voiceCatalog?.voice_genders?.[v] || ''),
+                    }))
+                    .sort((a, b) => {
+                      const order = { female: 0, male: 1 };
+                      const oa = order[a.g] ?? 2;
+                      const ob = order[b.g] ?? 2;
+                      if (oa !== ob) return oa - ob;
+                      return a.v.localeCompare(b.v);
+                    })
+                    .map(({ v, g }) => ({
+                      key: v,
+                      name: `${g === 'female' ? '♀' : g === 'male' ? '♂' : '•'} ${v}${v === catalogDefaultVoice ? ' (default)' : ''}`,
+                    })),
+                ]}
+                onChange={(v) => onVoiceNameChange(v)}
+                placeholder="Select voice"
+                searchPlaceholder="Search voices…"
+                maxHeight={260}
+              />
+            ) : (
+              <div className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/60 text-slate-400 dark:text-slate-500">
+                {modelId
+                  ? 'Catalog has no voices for this model — runtime will use per-client hardcode.'
+                  : 'Pick a model to see its voices.'}
+              </div>
+            )}
+            <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+              {voiceName
+                ? `Bots using "default" mode will speak as "${voiceName}". Per-bot override still works in the flow builder.`
+                : (resolvedVoice
+                    ? `Will fall back to "${resolvedVoice}" (catalog default).`
+                    : 'Leave blank to use the catalog default.')}
+            </p>
+          </div>
+        )}
 
         {/* Temperature */}
         <div>

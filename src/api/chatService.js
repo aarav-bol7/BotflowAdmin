@@ -55,7 +55,8 @@ export const chatService = {
     const p = new URLSearchParams({ type });
     if (startDate) p.set('start_date', startDate);
     if (endDate) p.set('end_date', endDate);
-    return _fetch(`${base}/sessions/${sessionId}/messages/?${p.toString()}`);
+    // sessionId is the ADK session id ("{botKey}:{userId}") — contains ':' and '+', must be encoded.
+    return _fetch(`${base}/sessions/${encodeURIComponent(sessionId)}/messages/?${p.toString()}`);
   },
 
   // Track B catch-up — sessions with since_ts. Envelope: { items, truncated, server_ts }.
@@ -78,7 +79,7 @@ export const chatService = {
   getSessionMessagesCatchup: async (sessionId, type = 'text', sinceTs, signal) => {
     const p = new URLSearchParams({ type });
     if (sinceTs) p.set('since_ts', sinceTs);
-    const res = await authenticatedFetch(`${base}/sessions/${sessionId}/messages/?${p.toString()}`, { signal });
+    const res = await authenticatedFetch(`${base}/sessions/${encodeURIComponent(sessionId)}/messages/?${p.toString()}`, { signal });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       const err = new Error(body.error || `Request failed (${res.status})`);

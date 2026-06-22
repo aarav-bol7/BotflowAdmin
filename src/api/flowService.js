@@ -151,12 +151,67 @@ export const flowService = {
   },
 
   getProviders: async () => {
+    // LEGACY alias kept for any caller that still expects the
+    // {key,name,color,icon_url,models:[str]} shape. New callers should use
+    // getChatProviders + getChatModelsForProvider so the backend owns the
+    // catalog contract end-to-end.
     const response = await authenticatedFetch(
       `${DYNAMICADK_BASE_URL}/api/llm/providers/`
     );
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
       throw new Error(body.error || `Failed to fetch providers (${response.status})`);
+    }
+    return response.json();
+  },
+
+  // Spec-shape catalog — provider list only (no models). Pair with
+  // getChatModelsForProvider for lazy per-provider model loading.
+  // Response shape:
+  //   { providers: [{id, label, icon, supports_chat, supports_realtime}] }
+  getChatProviders: async () => {
+    const response = await authenticatedFetch(
+      `${DYNAMICADK_BASE_URL}/api/model-catalog/providers?capability=chat`
+    );
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.error || `Failed to fetch chat providers (${response.status})`);
+    }
+    return response.json();
+  },
+
+  // Spec-shape catalog — chat models for a single provider. Returns
+  //   { provider, type, models: [{id, label, litellm_model, supports_tools,
+  //     context_limit, ...}] }
+  // The frontend treats every field as opaque so the backend can add /
+  // remove / sort / filter without coordinating with the UI.
+  getChatModelsForProvider: async (providerId) => {
+    if (!providerId) return { provider: '', type: 'chat', models: [] };
+    const id = encodeURIComponent(providerId);
+    const response = await authenticatedFetch(
+      `${DYNAMICADK_BASE_URL}/api/model-catalog/providers/${id}/models?type=chat`
+    );
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.error || `Failed to fetch chat models for ${providerId} (${response.status})`);
+    }
+    return response.json();
+  },
+
+  // Voice realtime catalog — admin-managed VoiceProvider/VoiceModel rows
+  // with the wire `protocol` (openai-realtime | gemini-live). Shape:
+  //   [{key, name, icon_url, protocol, websocket_url_template,
+  //     is_url_editable, models: [{model_id, display_name, is_default}]}]
+  //
+  // The page massages each entry into the same `{key, name, models: [str,]}`
+  // shape `ModelCard` expects so the picker code is identical to chat.
+  getVoiceProviders: async () => {
+    const response = await authenticatedFetch(
+      `${DYNAMICADK_BASE_URL}/api/llm/voice-models/`
+    );
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.error || `Failed to fetch voice providers (${response.status})`);
     }
     return response.json();
   },
@@ -330,6 +385,40 @@ export const flowService = {
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
       throw new Error(body.error || `Failed to list deleted bots (${response.status})`);
+    }
+    return response.json();
+  },
+
+  // --- Session deletion (credit usage is preserved server-side) ---
+  // Deletes flow.Session + VoiceTextSession + voice CallSession (and their
+  // cascaded messages/transcripts). LLMCreditDeduction rows are NOT deleted.
+
+  // Delete ONE session (a single chat/voice conversation) of a bot.
+  deleteSession: async (tenantId, botKey, channel, userId) => {
+    const params = new URLSearchParams();
+    if (channel) params.set('channel', channel);
+    if (userId) params.set('user_id', userId);
+    const qs = params.toString();
+    const response = await authenticatedFetch(
+      `${DYNAMICADK_BASE_URL}/api/flows/sessions/${encodeURIComponent(tenantId)}/${encodeURIComponent(botKey)}/${qs ? `?${qs}` : ''}`,
+      { method: 'DELETE' }
+    );
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.error || `Failed to delete session (${response.status})`);
+    }
+    return response.json();
+  },
+
+  // Delete ALL sessions of a bot, across every channel.
+  deleteAllBotSessions: async (tenantId, botKey) => {
+    const response = await authenticatedFetch(
+      `${DYNAMICADK_BASE_URL}/api/flows/sessions/${encodeURIComponent(tenantId)}/${encodeURIComponent(botKey)}/`,
+      { method: 'DELETE' }
+    );
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.error || `Failed to delete bot sessions (${response.status})`);
     }
     return response.json();
   },

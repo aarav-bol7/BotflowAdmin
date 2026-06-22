@@ -150,6 +150,7 @@ function Bot() {
   const [configLoading, setConfigLoading] = useState(false);
   const [configError, setConfigError] = useState(null);
   const [providers, setProviders] = useState([]);
+  const [voiceProviders, setVoiceProviders] = useState([]);
   const [expandedFlows, setExpandedFlows] = useState([]);
 
   // Bot-level config override state
@@ -455,10 +456,74 @@ function Bot() {
   };
 
   useEffect(() => {
-    flowService.getProviders()
-      .then((data) => setProviders(data || []))
+    // Chat: spec-shape catalog (provider list only — models load lazily
+    // per provider via getChatModelsForProvider so we don't pull all
+    // ~1500 models up-front).
+    flowService.getChatProviders()
+      .then((payload) => {
+        const list = Array.isArray(payload?.providers) ? payload.providers : [];
+        const normalized = list.map((p) => ({
+          key: p.id,
+          name: p.label || p.id,
+          icon_url: p.icon || '',
+          models: [], // lazy
+        }));
+        setProviders(normalized);
+      })
+      .catch((err) => {
+        // eslint-disable-next-line no-console
+        console.warn('[Bot] /api/model-catalog/providers?capability=chat failed:', err);
+      });
+    // Voice: admin-managed VoiceProvider/VoiceModel catalog (NOT models.dev).
+    flowService.getVoiceProviders()
+      .then((rows) => {
+        const normalized = (rows || []).map((p) => ({
+          key: p.key,
+          name: p.protocol ? `${p.name} · ${p.protocol}` : p.name,
+          icon_url: p.icon_url || '',
+          models: Array.isArray(p.models)
+            ? p.models.map((m) => (typeof m === 'string' ? m : m.model_id))
+            : [],
+        }));
+        setVoiceProviders(normalized);
+      })
       .catch(() => {});
   }, []);
+
+  // Lazy per-provider chat model fetch (same pattern as ChatModelNode +
+  // GlobalDefault). Triggered when the operator picks a chat provider in
+  // a Bot's config card.
+  const fetchChatModelsForProvider = useCallback((providerKey) => {
+    if (!providerKey) return;
+    setProviders((prev) => {
+      const existing = prev.find((p) => p.key === providerKey);
+      if (existing && Array.isArray(existing.models) && existing.models.length > 0) {
+        return prev;
+      }
+      return prev;
+    });
+    flowService.getChatModelsForProvider(providerKey)
+      .then((payload) => {
+        const ids = Array.isArray(payload?.models)
+          ? payload.models.map((m) => m.id || m).filter(Boolean)
+          : [];
+        setProviders((prev) => prev.map((p) =>
+          p.key === providerKey ? { ...p, models: ids } : p,
+        ));
+      })
+      .catch((err) => {
+        // eslint-disable-next-line no-console
+        console.warn(`[Bot] chat models fetch failed for ${providerKey}:`, err);
+      });
+  }, []);
+
+  // Whenever the active chat provider changes — either because the
+  // operator picked one in the dropdown OR because a freshly-loaded
+  // botConfig seeded the field — pull the matching model list so the
+  // Model dropdown is populated by the time it's opened.
+  useEffect(() => {
+    if (editChat.providerKey) fetchChatModelsForProvider(editChat.providerKey);
+  }, [editChat.providerKey, fetchChatModelsForProvider]);
 
   const filteredFlows = flows.filter(flow =>
     flow.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -572,6 +637,10 @@ function Bot() {
   // --- Bot config override helpers ---
   const getModelsForProvider = (providerKey) => {
     const p = providers.find((pr) => pr.key === providerKey);
+    return p ? p.models : [];
+  };
+  const getVoiceModelsForProvider = (providerKey) => {
+    const p = voiceProviders.find((pr) => pr.key === providerKey);
     return p ? p.models : [];
   };
 
@@ -1604,7 +1673,13 @@ function Bot() {
                             <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">Provider</label>
                             <select
                               value={editChat.providerKey}
-                              onChange={(e) => { setEditChat(prev => ({ ...prev, providerKey: e.target.value, modelId: '' })); markDirty('chat_provider_key'); markDirty('chat_model_id'); }}
+                              onChange={(e) => {
+                                const newKey = e.target.value;
+                                setEditChat(prev => ({ ...prev, providerKey: newKey, modelId: '' }));
+                                markDirty('chat_provider_key');
+                                markDirty('chat_model_id');
+                                if (newKey) fetchChatModelsForProvider(newKey);
+                              }}
                               className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                             >
                               <option value="">Select provider</option>
@@ -1704,10 +1779,10 @@ function Bot() {
                               className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                             >
                               <option value="">Select provider</option>
-                              {providers.map(p => (
+                              {voiceProviders.map(p => (
                                 <option key={p.key} value={p.key}>{p.name}</option>
                               ))}
-                              {editVoice.providerKey && !providers.find(p => p.key === editVoice.providerKey) && (
+                              {editVoice.providerKey && !voiceProviders.find(p => p.key === editVoice.providerKey) && (
                                 <option value={editVoice.providerKey}>{editVoice.providerKey}</option>
                               )}
                             </select>
@@ -1721,10 +1796,10 @@ function Bot() {
                               className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white disabled:opacity-50 focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                             >
                               <option value="">Select model</option>
-                              {getModelsForProvider(editVoice.providerKey).map(m => (
+                              {getVoiceModelsForProvider(editVoice.providerKey).map(m => (
                                 <option key={m} value={m}>{m}</option>
                               ))}
-                              {editVoice.modelId && !getModelsForProvider(editVoice.providerKey).includes(editVoice.modelId) && (
+                              {editVoice.modelId && !getVoiceModelsForProvider(editVoice.providerKey).includes(editVoice.modelId) && (
                                 <option value={editVoice.modelId}>{editVoice.modelId}</option>
                               )}
                             </select>
@@ -1960,6 +2035,26 @@ function Bot() {
                   className="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium transition-colors"
                 >
                   SAVE STATUS
+                </button>
+                <button
+                  onClick={async () => {
+                    if (!selectedFlow) return;
+                    if (!window.confirm(
+                      `Delete ALL sessions (chat + voice, every channel) for "${selectedFlow.name || selectedFlow.flowId}"?\n\nConversations and transcripts are removed. Credit usage is preserved.`
+                    )) return;
+                    try {
+                      const r = await flowService.deleteAllBotSessions(selectedFlow.tenantId, selectedFlow.flowId);
+                      const n = (r.sessions_deleted || 0) + (r.voice_sessions_deleted || 0) + (r.call_sessions_deleted || 0);
+                      toast.success(`Deleted ${n} session${n === 1 ? '' : 's'} (credit usage preserved)`);
+                    } catch (e) {
+                      toast.error(e.message || 'Failed to delete sessions');
+                    }
+                  }}
+                  title="Delete all chat + voice sessions of this bot, across every channel (credit usage preserved)"
+                  className="ml-auto flex items-center gap-2 px-6 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition-colors"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  Delete all sessions
                 </button>
               </div>
             </div>
