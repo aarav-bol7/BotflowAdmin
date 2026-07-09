@@ -1,7 +1,31 @@
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef, useCallback, useState } from 'react';
+import API_BASE_URL from '../config/api';
 
-const TURNSTILE_SITE_KEY = import.meta.env.VITE_TURNSTILE_SITE_KEY;
+const ENV_SITE_KEY = import.meta.env.VITE_TURNSTILE_SITE_KEY;
 const SCRIPT_ID = 'cf-turnstile-script';
+
+// Domains are spread across a pool of Cloudflare Turnstile widgets, so the
+// correct site key depends on which hostname we're served from. A single
+// hardcoded VITE_TURNSTILE_SITE_KEY is domain-locked and fails on the admin
+// host — resolve the right key per hostname from the auth backend (the same
+// endpoint frontend-chatbot uses), and keep the env value only as a fallback.
+const siteKeyCache = new Map();
+
+function resolveSiteKey() {
+  const host = (typeof window !== 'undefined' && window.location.hostname) || '';
+  if (siteKeyCache.has(host)) return siteKeyCache.get(host);
+
+  const base = (API_BASE_URL || '').replace(/\/$/, '');
+  const url = `${base}/api/turnstile/site-key/?domain=${encodeURIComponent(host)}`;
+
+  const promise = fetch(url, { credentials: 'omit' })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((data) => (data && data.site_key) || ENV_SITE_KEY || '')
+    .catch(() => ENV_SITE_KEY || '');
+
+  siteKeyCache.set(host, promise);
+  return promise;
+}
 
 function loadTurnstileScript() {
   return new Promise((resolve, reject) => {
@@ -33,8 +57,21 @@ function loadTurnstileScript() {
 export default function TurnstileWidget({ onToken, action }) {
   const containerRef = useRef(null);
   const widgetIdRef = useRef(null);
+  const [siteKey, setSiteKey] = useState(null);
+
+  // Resolve the site key for this hostname before rendering the widget.
+  useEffect(() => {
+    let cancelled = false;
+    resolveSiteKey().then((key) => {
+      if (!cancelled) setSiteKey(key || '');
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
+    if (!siteKey) return;
     let cancelled = false;
 
     loadTurnstileScript().then(() => {
@@ -47,7 +84,8 @@ export default function TurnstileWidget({ onToken, action }) {
       }
 
       widgetIdRef.current = window.turnstile.render(containerRef.current, {
-        sitekey: TURNSTILE_SITE_KEY,
+        sitekey: siteKey,
+        size: 'flexible',
         action: action || undefined,
         callback: (token) => onToken?.(token),
         'expired-callback': () => onToken?.(null),
@@ -62,7 +100,7 @@ export default function TurnstileWidget({ onToken, action }) {
         widgetIdRef.current = null;
       }
     };
-  }, [action, onToken]);
+  }, [action, onToken, siteKey]);
 
   const reset = useCallback(() => {
     if (widgetIdRef.current !== null && window.turnstile) {
@@ -70,10 +108,14 @@ export default function TurnstileWidget({ onToken, action }) {
     }
   }, []);
 
-  if (!TURNSTILE_SITE_KEY) {
+  if (siteKey === null) {
+    return null; // resolving — render nothing briefly
+  }
+
+  if (!siteKey) {
     return (
       <p className="text-xs text-red-500 text-center">
-        Missing VITE_TURNSTILE_SITE_KEY in .env
+        Turnstile site key unavailable for this domain
       </p>
     );
   }
