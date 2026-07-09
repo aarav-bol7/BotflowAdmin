@@ -65,7 +65,9 @@ function UserManagement() {
           clientId: c.tenantId,
           clientName: c.tenantName || c.tenantId,
           totalBots: c.totalBots || 0,
-          totalUsers: c.sessionCount || 0,
+          // userCount = distinct users (text + voice), same semantic as the
+          // Bots tab; sessionCount kept as fallback for an older backend.
+          totalUsers: c.userCount ?? c.sessionCount ?? 0,
           activeUsers: c.activeUsers || 0,
           totalUsedTokens: c.totalTokens || 0,
           totalCalls: c.totalCalls || 0,

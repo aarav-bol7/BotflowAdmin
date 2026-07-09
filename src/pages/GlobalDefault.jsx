@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Save, Loader2, Brain, Mic, Database, AlertCircle, CheckCircle, Eye, EyeOff, CreditCard, Phone, Bell, RefreshCw } from 'lucide-react';
+import { Save, Loader2, Brain, Mic, Database, AlertCircle, CheckCircle, Eye, EyeOff, CreditCard, Phone, Bell } from 'lucide-react';
 import { flowService } from '../api/flowService';
 import { botflowWs } from '../api/botflowWebSocket';
+import GlobalDefaultAlerts from '../components/GlobalDefaultAlerts';
 import toast from 'react-hot-toast';
 
 // ─── Track D recovery (2026-04-23): self-save correlation tokens ──────────
@@ -135,9 +136,11 @@ function GlobalDefault() {
   const lastLoadedBillingRef = useRef({ llm: null, voice: null });
   const isInitialFetchPendingRef = useRef(true);
   const hasPendingEventRef = useRef(false);
-  // externalChanges: per-section map of {field: {incomingValue, sectionKey}}.
-  // Non-empty map renders the sticky banner above the page.
-  const [externalChanges, setExternalChanges] = useState({});
+  // NOTE (2026-07-09): the Track-D "Another admin updated these settings"
+  // collision banner was removed — this is a single-admin deployment, so the
+  // banner only ever fired on echoes of the admin's own saves. Conflicting
+  // external updates now silently keep the LOCAL edit (clean fields still
+  // live-update, self-echoes still absorb via _matchSelfEcho).
 
   // Refs so WS handlers always see latest local state for dirty detection.
   const localChatRef = useRef({});
@@ -417,9 +420,9 @@ function GlobalDefault() {
         lastLoadedDefaultsRef.current.database = { ...payload.database };
       }
     }
-    if (Object.keys(allConflicts).length > 0) {
-      setExternalChanges((prev) => ({ ...prev, ...allConflicts }));
-    }
+    // Conflicts (local dirty + external change) keep the LOCAL edit silently —
+    // banner removed for the single-admin deployment.
+    void allConflicts;
   }, [_mergeSection]);
 
   const handleBillingUpdate = useCallback((payload) => {
@@ -453,9 +456,8 @@ function GlobalDefault() {
         lastLoadedBillingRef.current[section] = { ...inc };
       }
     });
-    if (Object.keys(conflicts).length > 0) {
-      setExternalChanges((prev) => ({ ...prev, ...conflicts }));
-    }
+    // Conflicts keep the LOCAL edit silently — banner removed (single admin).
+    void conflicts;
   }, []);
 
   // Stash handlers in refs so the init-replay path can invoke them.
@@ -489,43 +491,6 @@ function GlobalDefault() {
       botflowWs.disconnect();
     };
   }, []);
-
-  // Banner action: apply all pending external changes and clear banner.
-  const applyExternalChanges = useCallback(() => {
-    Object.entries(externalChanges).forEach(([field, { incomingValue, sectionKey }]) => {
-      // Defaults — chat
-      if (sectionKey === 'chat') {
-        if (field === 'provider_key') setChatProviderKey(incomingValue);
-        else if (field === 'model_id') setChatModelId(incomingValue);
-        else if (field === 'api_key') setChatApiKey(incomingValue);
-        else if (field === 'temperature') setChatTemperature(incomingValue);
-        lastLoadedDefaultsRef.current.chat[field] = incomingValue;
-      } else if (sectionKey === 'voice') {
-        if (field === 'provider_key') setVoiceProviderKey(incomingValue);
-        else if (field === 'model_id') setVoiceModelId(incomingValue);
-        else if (field === 'api_key') setVoiceApiKey(incomingValue);
-        else if (field === 'temperature') setVoiceTemperature(incomingValue);
-        else if (field === 'websocket_url') setVoiceWebsocketUrl(incomingValue || '');
-        else if (field === 'voice_name') setVoiceName(incomingValue || '');
-        lastLoadedDefaultsRef.current.voice[field] = incomingValue;
-      } else if (sectionKey === 'notifications') {
-        if (field === 'notifications_enabled') setNotificationsEnabled(!!incomingValue);
-        lastLoadedDefaultsRef.current.notifications[field] = incomingValue;
-      } else if (sectionKey === 'database') {
-        applyDatabasePayload(incomingValue);
-        lastLoadedDefaultsRef.current.database = { ...incomingValue };
-      } else if (sectionKey === 'billing.llm') {
-        setLlmBilling(incomingValue);
-        if (!lastLoadedBillingRef.current) lastLoadedBillingRef.current = {};
-        lastLoadedBillingRef.current.llm = { ...incomingValue };
-      } else if (sectionKey === 'billing.voice') {
-        setVoiceBilling(incomingValue);
-        if (!lastLoadedBillingRef.current) lastLoadedBillingRef.current = {};
-        lastLoadedBillingRef.current.voice = { ...incomingValue };
-      }
-    });
-    setExternalChanges({});
-  }, [externalChanges]);
 
   // Helper to apply a database payload via individual setters.
   function applyDatabasePayload(db) {
@@ -806,31 +771,9 @@ function GlobalDefault() {
         </p>
       </div>
 
-      {/* Track D: external-change banner. Non-dismissible — "Refresh" is the
-          only way to clear it. Prevents silent revert of another admin's edit. */}
-      {Object.keys(externalChanges).length > 0 && (
-        <div className="flex items-start gap-3 p-4 rounded-xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/50">
-          <AlertCircle className="w-5 h-5 text-amber-500 mt-0.5 flex-shrink-0" />
-          <div className="flex-1">
-            <p className="text-sm font-medium text-amber-900 dark:text-amber-200">
-              Another admin updated these settings:
-            </p>
-            <p className="text-sm text-amber-700 dark:text-amber-300 mt-1">
-              {Object.keys(externalChanges).join(', ')}
-            </p>
-            <p className="text-xs text-amber-600 dark:text-amber-400 mt-2">
-              Your local edits are preserved. Click &quot;Refresh&quot; to replace them with the
-              latest values, or save to keep your edits (overwriting theirs).
-            </p>
-          </div>
-          <button
-            onClick={applyExternalChanges}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-sm font-medium rounded-lg transition-colors"
-          >
-            <RefreshCw className="w-3.5 h-3.5" /> Refresh
-          </button>
-        </div>
-      )}
+      {/* Platform-level failures of the defaults configured below (expired
+          key, dead model, quota) — same rows as the header bell, in full. */}
+      <GlobalDefaultAlerts />
 
       {/* Two cards in a row */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

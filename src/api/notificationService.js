@@ -92,6 +92,22 @@ export const notificationService = {
   },
 
   /**
+   * Delete (dismiss) one notification. Because dedup merges repeats into the
+   * existing row, deleting a solved alert means a RECURRENCE creates a fresh
+   * unread row — so a new outbreak is visible instead of silently merging
+   * into an already-seen notification.
+   * @param {string} id - notification UUID
+   */
+  deleteNotification: async (id) => {
+    const response = await authenticatedFetch(`${BASE}/${id}/`, { method: 'DELETE' });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.error || `Failed to delete notification (${response.status})`);
+    }
+    return response.json();
+  },
+
+  /**
    * Track B catch-up: fetch notifications created on/after `since_ts`.
    * Response shape: { items, truncated, server_ts }.
    * @param {object} filters - includes since_ts (required) + usual filters.

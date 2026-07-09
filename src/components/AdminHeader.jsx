@@ -1,8 +1,24 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Shield, User, LogOut, Bell, CheckCircle2, AlertCircle, Info, X, Mail, Phone, Edit2, Save, XCircle, Camera, Menu } from 'lucide-react';
 import { getAdminData, logout } from '../utils/adminAuthUtils';
+import { notificationService, notificationWs } from '../api/notificationService';
+import { GD_ALERTS_CHANGED } from './GlobalDefaultAlerts';
 import toast from 'react-hot-toast';
+
+// The bell is scoped to platform-level Global Default failures (chat/voice
+// LLM key expired, model dead, ...) — the full firehose lives on the
+// Notifications tab; the deep-dive panel lives on the Global Default tab.
+const BELL_CATEGORY = 'global_default_failure';
+
+const timeAgo = (iso) => {
+  if (!iso) return '';
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} hr ago`;
+  return `${Math.floor(s / 86400)} d ago`;
+};
 
 function AdminHeader({ title = 'Admin Dashboard', subtitle = 'System Administration', onMenuClick }) {
   const navigate = useNavigate();
@@ -14,15 +30,73 @@ function AdminHeader({ title = 'Admin Dashboard', subtitle = 'System Administrat
   const profileMenuRef = useRef(null);
   const notificationMenuRef = useRef(null);
   const defaultProfileImage = 'https://chat.bol7.com/Files/Whatsapp_251218044725.png';
-  
-  // Mock notifications - in real app, this would come from API
-  const [notifications] = useState([
-    { id: 1, type: 'success', title: 'System Update', message: 'All systems are running smoothly', time: '2 minutes ago', read: false },
-    { id: 2, type: 'info', title: 'New User Registered', message: 'A new user has joined the platform', time: '15 minutes ago', read: false },
-    { id: 3, type: 'warning', title: 'High Traffic Alert', message: 'Traffic is 20% higher than usual', time: '1 hour ago', read: true },
-  ]);
-  
-  const unreadCount = notifications.filter(n => !n.read).length;
+
+  // Global Default failure notifications (real data + realtime).
+  const [notifications, setNotifications] = useState([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+
+  const refreshBell = useCallback(() => {
+    notificationService.fetchNotifications({ category: BELL_CATEGORY, page_size: 10 })
+      .then((data) => setNotifications(data.notifications || []))
+      .catch(() => {});
+    notificationService.getUnreadCount({ category: BELL_CATEGORY })
+      .then((data) => setUnreadCount(data.count || 0))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    refreshBell();
+    notificationWs.connect();
+    const isBell = (n) => n && n.category === BELL_CATEGORY;
+    const offNew = notificationWs.on('new_notification', (n) => {
+      if (!isBell(n)) return;
+      setNotifications((prev) => [n, ...prev.filter((p) => p.id !== n.id)].slice(0, 10));
+      setUnreadCount((c) => c + 1);
+    });
+    const offUpd = notificationWs.on('notification_updated', (n) => {
+      if (!isBell(n)) return;
+      // Dedup merge / mark-read replace: refresh both list and count so the
+      // occurrence_count and read state stay truthful.
+      refreshBell();
+    });
+    const offReconnect = notificationWs.on('reconnected', refreshBell);
+    // Deletion doesn't ride the WS — the Global Default panel nudges us
+    // (and vice versa) after a dismiss.
+    const onChanged = () => refreshBell();
+    window.addEventListener(GD_ALERTS_CHANGED, onChanged);
+    return () => {
+      offNew(); offUpd(); offReconnect();
+      window.removeEventListener(GD_ALERTS_CHANGED, onChanged);
+    };
+  }, [refreshBell]);
+
+  const handleDismissNotification = (notification, e) => {
+    e.stopPropagation();
+    notificationService.deleteNotification(notification.id)
+      .then(() => {
+        setNotifications((prev) => prev.filter((n) => n.id !== notification.id));
+        if (!notification.is_read) setUnreadCount((c) => Math.max(0, c - 1));
+        window.dispatchEvent(new CustomEvent(GD_ALERTS_CHANGED));
+      })
+      .catch(() => {});
+  };
+
+  const handleNotificationClick = (notification) => {
+    if (!notification.is_read) {
+      notificationService.markRead([notification.id])
+        .then(() => {
+          setNotifications((prev) => prev.map((n) => (
+            n.id === notification.id ? { ...n, is_read: true } : n
+          )));
+          setUnreadCount((c) => Math.max(0, c - 1));
+        })
+        .catch(() => {});
+    }
+    setShowNotifications(false);
+    // These are Global Default model failures — land the admin on the tab
+    // that fixes them (its alerts panel shows the same rows in full).
+    navigate('/global-default');
+  };
 
   useEffect(() => {
     const data = getAdminData();
@@ -210,12 +284,12 @@ function AdminHeader({ title = 'Admin Dashboard', subtitle = 'System Administrat
                   )}
                 </button>
 
-                {/* Notifications Dropdown */}
+                {/* Notifications Dropdown — Global Default model failures */}
                 {showNotifications && (
                   <div className="absolute right-0 mt-2 w-80 max-w-[calc(100vw-2rem)] bg-white dark:bg-slate-900 rounded-xl shadow-xl border border-slate-200/50 dark:border-slate-800/50 py-2 z-50 animate-scale-in max-h-96 overflow-hidden flex flex-col">
                     {/* Header */}
                     <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
-                      <h3 className="text-sm font-semibold text-slate-900 dark:text-white">Notifications</h3>
+                      <h3 className="text-sm font-semibold text-slate-900 dark:text-white">Global Default alerts</h3>
                       <button
                         onClick={() => setShowNotifications(false)}
                         className="p-1 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
@@ -228,26 +302,31 @@ function AdminHeader({ title = 'Admin Dashboard', subtitle = 'System Administrat
                     <div className="overflow-y-auto flex-1">
                       {notifications.length === 0 ? (
                         <div className="px-4 py-8 text-center">
-                          <Bell className="w-8 h-8 text-slate-400 mx-auto mb-2" />
-                          <p className="text-sm text-slate-500 dark:text-slate-400">No notifications</p>
+                          <CheckCircle2 className="w-8 h-8 text-green-500/70 mx-auto mb-2" />
+                          <p className="text-sm text-slate-500 dark:text-slate-400">Default chat &amp; voice models are healthy</p>
                         </div>
                       ) : (
                         <div className="divide-y divide-slate-200 dark:divide-slate-800">
                           {notifications.map((notification) => {
-                            const IconComponent = 
-                              notification.type === 'success' ? CheckCircle2 :
-                              notification.type === 'warning' ? AlertCircle :
+                            const sev = notification.severity;
+                            const IconComponent =
+                              sev === 'critical' || sev === 'error' ? AlertCircle :
+                              sev === 'warning' ? AlertCircle :
                               Info;
                             const iconColor =
-                              notification.type === 'success' ? 'text-green-600 dark:text-green-400' :
-                              notification.type === 'warning' ? 'text-yellow-600 dark:text-yellow-400' :
+                              sev === 'critical' || sev === 'error' ? 'text-red-600 dark:text-red-400' :
+                              sev === 'warning' ? 'text-yellow-600 dark:text-yellow-400' :
                               'text-blue-600 dark:text-blue-400';
-                            
+                            const service = (notification.metadata && notification.metadata.service) || '';
+                            const occurrences = notification.occurrence_count > 1
+                              ? ` ×${notification.occurrence_count}` : '';
+
                             return (
                               <div
                                 key={notification.id}
+                                onClick={() => handleNotificationClick(notification)}
                                 className={`px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors cursor-pointer ${
-                                  !notification.read ? 'bg-blue-50/50 dark:bg-blue-900/10' : ''
+                                  !notification.is_read ? 'bg-blue-50/50 dark:bg-blue-900/10' : ''
                                 }`}
                               >
                                 <div className="flex items-start gap-3">
@@ -257,17 +336,29 @@ function AdminHeader({ title = 'Admin Dashboard', subtitle = 'System Administrat
                                   <div className="flex-1 min-w-0">
                                     <p className="text-sm font-medium text-slate-900 dark:text-white">
                                       {notification.title}
+                                      {service && (
+                                        <span className="ml-1.5 inline-flex px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold uppercase bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 align-middle">
+                                          {service}
+                                        </span>
+                                      )}
                                     </p>
                                     <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 line-clamp-2">
                                       {notification.message}
                                     </p>
                                     <p className="text-xs text-slate-400 dark:text-slate-500 mt-1">
-                                      {notification.time}
+                                      {timeAgo(notification.last_occurred_at || notification.created_at)}{occurrences}
                                     </p>
                                   </div>
-                                  {!notification.read && (
+                                  {!notification.is_read && (
                                     <div className="w-2 h-2 bg-blue-500 rounded-full flex-shrink-0 mt-2"></div>
                                   )}
+                                  <button
+                                    onClick={(e) => handleDismissNotification(notification, e)}
+                                    className="p-1 rounded-lg text-slate-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/30 transition-colors flex-shrink-0"
+                                    title="Dismiss — a fresh alert will appear if the issue recurs"
+                                  >
+                                    <X className="w-3.5 h-3.5" />
+                                  </button>
                                 </div>
                               </div>
                             );
@@ -277,19 +368,27 @@ function AdminHeader({ title = 'Admin Dashboard', subtitle = 'System Administrat
                     </div>
 
                     {/* Footer */}
-                    {notifications.length > 0 && (
-                      <div className="px-4 py-2 border-t border-slate-200 dark:border-slate-800">
-                        <button 
-                          onClick={() => {
-                            setShowNotifications(false);
-                            navigate('/notifications');
-                          }}
-                          className="w-full text-xs text-center text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 dark:hover:text-indigo-300 font-medium py-1"
-                        >
-                          View all notifications
-                        </button>
-                      </div>
-                    )}
+                    <div className="px-4 py-2 border-t border-slate-200 dark:border-slate-800 flex items-center gap-2">
+                      <button
+                        onClick={() => {
+                          setShowNotifications(false);
+                          navigate('/global-default');
+                        }}
+                        className="flex-1 text-xs text-center text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 dark:hover:text-indigo-300 font-medium py-1"
+                      >
+                        Open Global Default
+                      </button>
+                      <span className="text-slate-300 dark:text-slate-700">|</span>
+                      <button
+                        onClick={() => {
+                          setShowNotifications(false);
+                          navigate('/notifications');
+                        }}
+                        className="flex-1 text-xs text-center text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 dark:hover:text-indigo-300 font-medium py-1"
+                      >
+                        All notifications
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>

@@ -31,6 +31,11 @@ const CATEGORY_LABELS = {
   channel_send_failure: 'Channel Send',
   flow_http_failure: 'HTTP Response',
   inbound_routing_failure: 'Inbound Routing',
+  voice_handshake_failure: 'Voice Handshake',
+  voice_billing_failure: 'Voice Billing',
+  voice_provider_failure: 'Voice Provider',
+  global_default_failure: 'Global Default',
+  hitl_request: 'Human Handoff',
 };
 
 const SEVERITY_OPTIONS = [
