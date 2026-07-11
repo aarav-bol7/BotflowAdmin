@@ -126,13 +126,19 @@ function GlobalDefault() {
   const [notificationsEnabled, setNotificationsEnabled] = useState(true);
   const [savingNotifications, setSavingNotifications] = useState(false);
 
+  // ─── WhatsApp voice-note transcription (STT — Voxtral/Mistral) ─────────
+  const [transcriptionModel, setTranscriptionModel] = useState('');
+  const [transcriptionApiKey, setTranscriptionApiKey] = useState('');
+  const [showTranscriptionApiKey, setShowTranscriptionApiKey] = useState(false);
+  const [savingTranscription, setSavingTranscription] = useState(false);
+
   // ─── Track D: cross-session sync state ─────────────────────────────────
   // lastLoaded* refs hold the last server-authoritative values. Diffing local
   // state vs these refs yields per-field dirty detection without instrumenting
   // every onChange handler. When a WS update event arrives, we split incoming
   // fields into "clean" (silent replace) and "conflict" (banner) by comparing
   // local=lastLoaded (clean) vs local!=lastLoaded (dirty).
-  const lastLoadedDefaultsRef = useRef({ chat: {}, voice: {}, database: {}, notifications: {} });
+  const lastLoadedDefaultsRef = useRef({ chat: {}, voice: {}, database: {}, notifications: {}, transcription: {} });
   const lastLoadedBillingRef = useRef({ llm: null, voice: null });
   const isInitialFetchPendingRef = useRef(true);
   const hasPendingEventRef = useRef(false);
@@ -149,6 +155,7 @@ function GlobalDefault() {
   const localLlmBillingRef = useRef({});
   const localVoiceBillingRef = useRef({});
   const localNotificationsRef = useRef({});
+  const localTranscriptionRef = useRef({});
 
   useEffect(() => {
     Promise.all([
@@ -261,6 +268,10 @@ function GlobalDefault() {
       if (defaults.notifications) {
         setNotificationsEnabled(defaults.notifications.notifications_enabled ?? true);
       }
+      if (defaults.transcription) {
+        setTranscriptionModel(defaults.transcription.model || '');
+        setTranscriptionApiKey(defaults.transcription.api_key || '');
+      }
       if (billingConfig) {
         if (billingConfig.llm) setLlmBilling(billingConfig.llm);
         if (billingConfig.voice) setVoiceBilling(billingConfig.voice);
@@ -271,6 +282,7 @@ function GlobalDefault() {
         voice: (defaults && defaults.voice) || {},
         database: (defaults && defaults.database) || {},
         notifications: (defaults && defaults.notifications) || { notifications_enabled: true },
+        transcription: (defaults && defaults.transcription) || {},
       };
       lastLoadedBillingRef.current = billingConfig || { llm: null, voice: null };
       setLoading(false);
@@ -313,6 +325,9 @@ function GlobalDefault() {
   useEffect(() => {
     localNotificationsRef.current = { notifications_enabled: notificationsEnabled };
   }, [notificationsEnabled]);
+  useEffect(() => {
+    localTranscriptionRef.current = { model: transcriptionModel, api_key: transcriptionApiKey };
+  }, [transcriptionModel, transcriptionApiKey]);
 
   // ─── Track D: merge handlers for WS config-updated events ──────────────
   // Algorithm (refined plan §7.4):
@@ -364,6 +379,9 @@ function GlobalDefault() {
       if (sent.has('notifications') && payload.notifications) {
         lastLoadedDefaultsRef.current.notifications = { ...payload.notifications };
       }
+      if (sent.has('transcription') && payload.transcription) {
+        lastLoadedDefaultsRef.current.transcription = { ...payload.transcription };
+      }
       return;
     }
     const allConflicts = {};
@@ -402,6 +420,14 @@ function GlobalDefault() {
       lastLoadedDefaultsRef.current.notifications,
       localNotificationsRef.current,
       { notifications_enabled: setNotificationsEnabled },
+    ));
+    // Transcription (STT)
+    Object.assign(allConflicts, _mergeSection(
+      'transcription',
+      payload.transcription || {},
+      lastLoadedDefaultsRef.current.transcription,
+      localTranscriptionRef.current,
+      { model: setTranscriptionModel, api_key: setTranscriptionApiKey },
     ));
     // Database: too many fields to enumerate setters; treat as opaque "section".
     // If local == lastLoaded for all db fields, silent replace all. Otherwise banner-only.
@@ -753,6 +779,24 @@ function GlobalDefault() {
     }
   };
 
+  const handleSaveTranscription = async () => {
+    setSavingTranscription(true);
+    const _token = _recordSaveToken('global.defaults_updated', ['transcription']);
+    try {
+      await flowService.updateGlobalDefaults({
+        transcription_model: (transcriptionModel || '').trim(),
+        transcription_api_key: (transcriptionApiKey || '').trim(),
+        _save_token: _token,
+      });
+      toast.success('Transcription settings saved');
+    } catch (err) {
+      _clearSaveToken('global.defaults_updated');
+      toast.error(err.message || 'Failed to save transcription settings');
+    } finally {
+      setSavingTranscription(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -930,6 +974,56 @@ function GlobalDefault() {
           <button onClick={handleSaveNotifications} disabled={savingNotifications} className="flex items-center gap-2 px-5 py-2.5 bg-amber-600 hover:bg-amber-700 disabled:bg-amber-400 text-white rounded-lg text-sm font-medium transition-colors">
             {savingNotifications ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
             {savingNotifications ? 'Saving...' : 'Save Notification Settings'}
+          </button>
+        </div>
+      </div>
+
+      {/* WhatsApp Voice-note Transcription (STT) */}
+      <div className="bg-white dark:bg-slate-900 rounded-xl border border-t-4 border-slate-200 dark:border-slate-800 border-t-amber-500 p-6">
+        <div className="flex items-center gap-3 mb-4">
+          <div className="p-2 rounded-lg bg-amber-500/10">
+            <Mic className="w-5 h-5 text-amber-500" />
+          </div>
+          <div>
+            <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">Voice-note Transcription</h3>
+            <p className="text-sm text-slate-500 dark:text-slate-400">Transcribes inbound WhatsApp voice notes to text (Voxtral / Mistral). Leave the API key blank to disable — voice notes then ask the user to type instead.</p>
+          </div>
+        </div>
+        <div className="grid grid-cols-1 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1.5">Model</label>
+            <input
+              type="text"
+              value={transcriptionModel}
+              onChange={(e) => setTranscriptionModel(e.target.value)}
+              placeholder="voxtral-mini-2602"
+              className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-amber-500"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1.5">API Key</label>
+            <div className="relative">
+              <input
+                type={showTranscriptionApiKey ? 'text' : 'password'}
+                value={transcriptionApiKey}
+                onChange={(e) => setTranscriptionApiKey(e.target.value)}
+                placeholder="Voxtral / Mistral API key"
+                className="w-full px-3 py-2 pr-10 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-amber-500"
+              />
+              <button
+                type="button"
+                onClick={() => setShowTranscriptionApiKey(!showTranscriptionApiKey)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+              >
+                {showTranscriptionApiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
+          </div>
+        </div>
+        <div className="flex justify-end mt-5">
+          <button onClick={handleSaveTranscription} disabled={savingTranscription} className="flex items-center gap-2 px-5 py-2.5 bg-amber-600 hover:bg-amber-700 disabled:bg-amber-400 text-white rounded-lg text-sm font-medium transition-colors">
+            {savingTranscription ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+            {savingTranscription ? 'Saving...' : 'Save Transcription Settings'}
           </button>
         </div>
       </div>
